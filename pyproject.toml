@@ -10,6 +10,11 @@ packages = [{include = "caldav_mcp", from = "src"}]
 python = "^3.10"
 fastmcp = "^2.0"
 caldav = "^1.3.5"
+# caldav's own metadata only caps icalendar<6.0.0 for python 3.8 - an
+# oversight, since caldav 1.6.0's vcal.py assumes icalendar.cal.component_factory
+# is dict-like, which broke in icalendar 6.x/7.x (it became a module). Pin
+# explicitly rather than relying on caldav's incomplete constraint.
+icalendar = "<6.0.0"
 pydantic = "^2.4.0"
 httpx = "^0.28.1"
 requests = "^2.31.0"
