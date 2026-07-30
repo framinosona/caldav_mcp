@@ -1,10 +1,69 @@
 """MCP server for CalDAV integration."""
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 from fastmcp import FastMCP
 import caldav
+import icalendar
+
+# Canonical attendee role <-> iCalendar ROLE parameter, matching the
+# framinosona/calendar-canonical-schema draft's Attendee.role field.
+_ROLE_TO_ICAL = {
+    "required": "REQ-PARTICIPANT",
+    "optional": "OPT-PARTICIPANT",
+    "resource": "NON-PARTICIPANT",
+}
+_ROLE_FROM_ICAL = {v: k for k, v in _ROLE_TO_ICAL.items()}
+
+
+def _parse_event_datetime(value: str):
+    """Parse a start/end string into a date (all-day) or datetime (timed) object.
+
+    caldav.Event/icalendar need an actual date/datetime object, not a raw
+    string - and which type you pass is what determines VALUE=DATE
+    (all-day) vs VALUE=DATE-TIME (timed) in the resulting iCalendar output.
+    A bare "YYYY-MM-DD" (no "T") is treated as all-day.
+    """
+    if len(value) == 10 and value.count("-") == 2 and "T" not in value:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    return datetime.fromisoformat(value)
+
+
+def _build_vevent_ical(event_data: Dict[str, Any]) -> str:
+    """Build a raw VEVENT iCalendar block from event_data.
+
+    Calendar.save_event(**kwargs)'s generic path (component.add(prop, value)
+    once per kwarg) can't represent attendees (needs one ATTENDEE line per
+    person, each with CN/ROLE/RSVP parameters) or recurrence (needs a real
+    icalendar.vRecur object, not a raw string) correctly - so this builds
+    the VEVENT directly with the icalendar library instead, verified against
+    the actual library behavior (multi-ATTENDEE lines and RRULE round-trip
+    correctly this way) before wiring it in here.
+    """
+    vevent = icalendar.Event()
+    vevent.add("uid", event_data["uid"])
+    vevent.add("dtstamp", datetime.now(timezone.utc))
+    vevent.add("dtstart", _parse_event_datetime(event_data["start"]))
+    vevent.add("dtend", _parse_event_datetime(event_data["end"]))
+    vevent.add("summary", event_data["summary"])
+
+    if event_data.get("location"):
+        vevent.add("location", event_data["location"])
+    if event_data.get("description"):
+        vevent.add("description", event_data["description"])
+    if event_data.get("recurrence"):
+        vevent.add("rrule", icalendar.vRecur.from_ical(event_data["recurrence"]))
+
+    for attendee in event_data.get("attendees", []):
+        addr = icalendar.vCalAddress(f"mailto:{attendee['email']}")
+        if attendee.get("name"):
+            addr.params["CN"] = attendee["name"]
+        addr.params["ROLE"] = _ROLE_TO_ICAL.get(attendee.get("role", "required"), "REQ-PARTICIPANT")
+        addr.params["RSVP"] = "TRUE"
+        vevent.add("attendee", addr, encode=0)
+
+    return vevent.to_ical().decode()
 
 
 def get_event_data(event):
@@ -41,13 +100,45 @@ def _serialize_event(event) -> Dict[str, Any]:
         dt = getattr(value, "dt", value)
         return dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
 
+    def _is_all_day(name):
+        value = comp.get(name)
+        if value is None:
+            return False
+        dt = getattr(value, "dt", value)
+        # a date (all-day) has no .hour; a datetime (timed) does
+        return not hasattr(dt, "hour")
+
+    def _recurrence():
+        rrule = comp.get("RRULE")
+        return rrule.to_ical().decode() if rrule is not None else None
+
+    def _attendees():
+        raw = comp.get("ATTENDEE")
+        if raw is None:
+            return []
+        entries = raw if isinstance(raw, list) else [raw]
+        result = []
+        for entry in entries:
+            email = str(entry).replace("mailto:", "", 1) if str(entry).lower().startswith("mailto:") else str(entry)
+            params = getattr(entry, "params", {}) or {}
+            result.append({
+                "email": email,
+                "name": params.get("CN"),
+                "role": _ROLE_FROM_ICAL.get(params.get("ROLE"), "required"),
+                "response_status": params.get("PARTSTAT"),
+            })
+        return result
+
     return {
         "uid": _field("UID"),
         "summary": _field("SUMMARY"),
         "start": _dt("DTSTART"),
         "end": _dt("DTEND"),
+        "all_day": _is_all_day("DTSTART"),
         "description": _field("DESCRIPTION"),
         "location": _field("LOCATION"),
+        "recurrence": _recurrence(),
+        "attendees": _attendees(),
         "url": str(getattr(event, "url", "")) or None,
     }
 
@@ -301,47 +392,44 @@ class CalDAVMCPServer:
     
     def create_event(self, calendar_id: str, event_data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new calendar event.
-        
+
         Args:
             calendar_id: The ID of the calendar to add the event to.
-            event_data: Dictionary containing event details (uid, summary, start, end, etc.).
-            
+            event_data: Dictionary containing event details. Required: uid,
+                summary, start, end. Optional: location, description,
+                recurrence (bare RRULE content, e.g.
+                "FREQ=WEEKLY;BYDAY=MO;COUNT=10", no "RRULE:" prefix),
+                attendees (list of {email, name?, role?} where role is
+                "required"|"optional"|"resource", default "required"). For
+                an all-day event, pass start/end as bare "YYYY-MM-DD" dates
+                (no time component) rather than a full datetime string.
+
         Returns:
             A dictionary with the created event details or an error message.
         """
         if not self._principal:
             return {"error": "Not connected to CalDAV server"}
-            
+
         try:
             calendar = self._get_calendar_by_id(calendar_id)
             if not calendar:
                 return {"error": f"Calendar with ID {calendar_id} not found"}
-            
+
             # Validate required fields
             required_fields = ['uid', 'summary', 'start', 'end']
             for field in required_fields:
                 if field not in event_data:
                     return {"error": f"Missing required field: {field}"}
 
-            # NOTE: caldav.Event's own __init__ takes client/url/data/parent/id/props -
-            # it does NOT accept uid/dtstart/dtend/summary/etc as kwargs (that only
-            # works via Calendar.save_event(), which builds the iCalendar body for you).
-            # Also: dtstart/dtend must be actual datetime objects, not raw strings.
-            dtstart = datetime.fromisoformat(event_data['start'])
-            dtend = datetime.fromisoformat(event_data['end'])
-
-            calendar.save_event(
-                uid=event_data['uid'],
-                dtstart=dtstart,
-                dtend=dtend,
-                summary=event_data['summary'],
-                location=event_data.get('location', ''),
-                description=event_data.get('description', ''),
-            )
+            # Built directly with icalendar rather than Calendar.save_event()'s
+            # generic **kwargs path - see _build_vevent_ical for why (attendees
+            # and recurrence need real icalendar types/multi-value handling
+            # that path can't represent).
+            calendar.save_event(ical=_build_vevent_ical(event_data))
 
             # Return the created event data
             return {"event": event_data}
-            
+
         except ValueError as ve:
             return {"error": str(ve)}
         except Exception as e:
