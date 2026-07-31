@@ -7,15 +7,20 @@ def run():
     parser = argparse.ArgumentParser(description="CalDAV MCP Server")
     parser.add_argument("--host", default="localhost", help="Host to bind to")
     parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
-    parser.add_argument("--transport", default="stdio", choices=["stdio", "sse"], help="Transport to use")
-    
+    parser.add_argument(
+        "--transport",
+        default="stdio",
+        choices=["stdio", "sse", "streamable-http"],
+        help="Transport to use",
+    )
+
     args = parser.parse_args()
-    
+
     server = CalDAVMCPServer()
     print(f"Starting CalDAV MCP server with {args.transport} transport")
-    
-    if args.transport == "sse":
-        server.run(transport="sse", host=args.host, port=args.port)
+
+    if args.transport in ("sse", "streamable-http"):
+        server.run(transport=args.transport, host=args.host, port=args.port)
     else:
         server.run(transport="stdio")
 
