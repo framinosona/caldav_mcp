@@ -18,6 +18,10 @@ icalendar = "<6.0.0"
 pydantic = "^2.4.0"
 httpx = "^0.28.1"
 requests = "^2.31.0"
+# vCard parsing/building for the CardDAV/contacts side - the `caldav`
+# package itself has no vCard support at all (confirmed via source
+# inspection), just a generic DAVClient WebDAV transport.
+vobject = "^0.9.6"
 
 [tool.poetry.group.dev.dependencies]
 black = "^23.7.0"
